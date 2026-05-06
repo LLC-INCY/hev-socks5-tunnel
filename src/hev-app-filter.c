@@ -39,6 +39,18 @@ static int g_uids_n;
 
 static HevAppFilterStats g_stats;
 
+/* In-process lookup is gated identically to hev-app-filter-lookup.c.
+ * Keep these in sync. */
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if (defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX) || \
+    defined(_WIN32) || defined(__MSYS__)
+#define HAVE_INPROC_LOOKUP 1
+#else
+#define HAVE_INPROC_LOOKUP 0
+#endif
+
 /* ---------- helpers ---------- */
 
 static int
@@ -69,6 +81,7 @@ pids_contains (int pid)
     return 0;
 }
 
+#if HAVE_INPROC_LOOKUP
 static int
 uids_contains (int uid)
 {
@@ -77,6 +90,7 @@ uids_contains (int uid)
             return 1;
     return 0;
 }
+#endif
 
 /* ---------- yaml parsing ---------- */
 
@@ -240,12 +254,6 @@ hev_app_filter_get_control_socket (void)
 }
 
 /* ---------- decision ---------- */
-
-#if defined(__APPLE__) || defined(_WIN32) || defined(__MSYS__)
-#define HAVE_INPROC_LOOKUP 1
-#else
-#define HAVE_INPROC_LOOKUP 0
-#endif
 
 HevAppFilterDecision
 hev_app_filter_decide (const HevAppFilterFlow *flow, int *out_pid,

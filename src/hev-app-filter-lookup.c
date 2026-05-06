@@ -17,11 +17,20 @@
 #include "hev-app-filter-lookup.h"
 
 #ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
+/* libproc / proc_pidfdinfo is macOS-only; iOS/tvOS/watchOS lack the
+ * header even though __APPLE__ is defined. */
+#if defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX
+#define HAVE_MACOS_LOOKUP 1
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#else
+#define HAVE_MACOS_LOOKUP 0
 #endif
 
 #if defined(_WIN32) || defined(__MSYS__)
@@ -35,7 +44,7 @@
 #define CACHE_SLOTS    64
 #define CACHE_TTL_SEC  60
 
-#if defined(__APPLE__) || defined(_WIN32) || defined(__MSYS__)
+#if HAVE_MACOS_LOOKUP || defined(_WIN32) || defined(__MSYS__)
 #define HAVE_INPROC_LOOKUP 1
 #else
 #define HAVE_INPROC_LOOKUP 0
@@ -102,7 +111,7 @@ hev_app_filter_lookup_set_override (HevAppFilterLookupFn fn)
     g_override = fn;
 }
 
-#ifdef __APPLE__
+#if HAVE_MACOS_LOOKUP
 
 /*
  * Match a single socket-info struct against the wanted flow. Returns 1 on
@@ -275,7 +284,7 @@ done:
     return rc;
 }
 
-#endif /* __APPLE__ */
+#endif /* HAVE_MACOS_LOOKUP */
 
 #if defined(_WIN32) || defined(__MSYS__)
 
@@ -503,14 +512,16 @@ hev_app_filter_lookup (const HevAppFilterFlow *flow,
     if (g_override)
         return g_override (flow, out);
 
-#if defined(__APPLE__)
+#if HAVE_MACOS_LOOKUP
     return lookup_macos (flow, out);
 #elif defined(_WIN32) || defined(__MSYS__)
     return lookup_windows (flow, out);
 #else
-    /* Linux: in-process lookup is intentionally unsupported; cgroup-v2 +
-     * nft handles enforcement out of band. Returning -1 means callers
-     * see lookup-failed and treat the flow as unmatched. */
+    /* Linux / iOS / Android: in-process lookup is intentionally
+     * unsupported. On Linux, cgroup-v2 + nft handles enforcement out of
+     * band; on mobile platforms, app-filter is configured no-op (the
+     * host VPN extension does the filtering). Returning -1 makes
+     * callers see lookup-failed and treat the flow as unmatched. */
     (void) flow;
     return -1;
 #endif

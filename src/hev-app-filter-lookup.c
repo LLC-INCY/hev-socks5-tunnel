@@ -35,6 +35,12 @@
 #define CACHE_SLOTS    64
 #define CACHE_TTL_SEC  60
 
+#if defined(__APPLE__) || defined(_WIN32) || defined(__MSYS__)
+#define HAVE_INPROC_LOOKUP 1
+#else
+#define HAVE_INPROC_LOOKUP 0
+#endif
+
 typedef struct
 {
     int      pid;
@@ -45,6 +51,8 @@ typedef struct
 static CacheEntry g_cache[CACHE_SLOTS];
 
 static HevAppFilterLookupFn g_override;
+
+#if HAVE_INPROC_LOOKUP
 
 static uint64_t
 mono_now_sec (void)
@@ -79,6 +87,8 @@ cache_put (int pid, const char *path)
     strncpy (e->path, path, sizeof (e->path) - 1);
     e->path[sizeof (e->path) - 1] = '\0';
 }
+
+#endif /* HAVE_INPROC_LOOKUP */
 
 void
 hev_app_filter_lookup_cache_clear (void)

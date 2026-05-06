@@ -7,10 +7,21 @@
  ============================================================================
  */
 
+/* On MSYS/MinGW, winsock2.h MUST be included before any header that
+ * pulls in <sys/types.h> (fd_set conflict). Do it first. */
+#if defined(_WIN32) || defined(__MSYS__)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <iphlpapi.h>
+#include <psapi.h>
+#endif
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include "hev-logger.h"
@@ -31,14 +42,6 @@
 #include <arpa/inet.h>
 #else
 #define HAVE_MACOS_LOOKUP 0
-#endif
-
-#if defined(_WIN32) || defined(__MSYS__)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <iphlpapi.h>
-#include <psapi.h>
 #endif
 
 #define CACHE_SLOTS    64
@@ -336,11 +339,11 @@ is_packaged_host (const char *path)
     /* Match on the basename only. */
     const char *base = strrchr (path, '\\');
     base = base ? base + 1 : path;
-    if (_stricmp (base, "svchost.exe") == 0)
+    if (strcasecmp (base, "svchost.exe") == 0)
         return 1;
-    if (_stricmp (base, "ApplicationFrameHost.exe") == 0)
+    if (strcasecmp (base, "ApplicationFrameHost.exe") == 0)
         return 1;
-    if (_stricmp (base, "RuntimeBroker.exe") == 0)
+    if (strcasecmp (base, "RuntimeBroker.exe") == 0)
         return 1;
     return 0;
 }

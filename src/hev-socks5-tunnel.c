@@ -36,6 +36,8 @@
 #include "hev-config-const.h"
 #include "hev-socks5-session-tcp.h"
 #include "hev-socks5-session-udp.h"
+#include "hev-app-filter.h"
+#include "hev-app-filter-ctrl.h"
 
 #include "hev-socks5-tunnel.h"
 
@@ -173,6 +175,25 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
     if (!run)
         return ERR_RST;
 
+    if (hev_app_filter_enabled ()) {
+        HevAppFilterFlow flow;
+        int pid = -1;
+        const char *path = NULL;
+        hev_app_filter_flow_from_lwip (&flow, IPPROTO_TCP,
+                                       &pcb->remote_ip, pcb->remote_port,
+                                       &pcb->local_ip, pcb->local_port);
+        HevAppFilterDecision d = hev_app_filter_decide (&flow, &pid, &path);
+        if (d == HEV_APP_FILTER_DECISION_DROP) {
+            LOG_D ("[app-filter] tcp drop pid=%d", pid);
+            return ERR_RST;
+        }
+        if (d == HEV_APP_FILTER_DECISION_BYPASS) {
+            LOG_D ("[app-filter] tcp bypass pid=%d", pid);
+            hev_app_filter_ctrl_emit_bypass (pid, path, &flow);
+            return ERR_RST;
+        }
+    }
+
     tcp = hev_socks5_session_tcp_new (pcb, &mutex);
     if (!tcp)
         return ERR_MEM;
@@ -244,6 +265,27 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
         int fport = hev_config_get_mapdns_port ();
         if (fport == port && faddr == ip_2_ip4 (addr)->addr) {
             udp_recv (pcb, dns_recv_handler, dns);
+            return;
+        }
+    }
+
+    if (hev_app_filter_enabled ()) {
+        HevAppFilterFlow flow;
+        int pid = -1;
+        const char *path = NULL;
+        hev_app_filter_flow_from_lwip (&flow, IPPROTO_UDP,
+                                       addr, port,
+                                       &pcb->local_ip, pcb->local_port);
+        HevAppFilterDecision d = hev_app_filter_decide (&flow, &pid, &path);
+        if (d == HEV_APP_FILTER_DECISION_DROP) {
+            LOG_D ("[app-filter] udp drop pid=%d", pid);
+            udp_remove (pcb);
+            return;
+        }
+        if (d == HEV_APP_FILTER_DECISION_BYPASS) {
+            LOG_D ("[app-filter] udp bypass pid=%d", pid);
+            hev_app_filter_ctrl_emit_bypass (pid, path, &flow);
+            udp_remove (pcb);
             return;
         }
     }
@@ -638,6 +680,14 @@ hev_socks5_tunnel_init (int tun_fd)
     if (res < 0)
         goto exit;
 
+    /* Optional: bind app-filter control socket if configured. Failure
+     * here is non-fatal (we log and continue). */
+    if (hev_app_filter_enabled () &&
+        hev_app_filter_get_control_socket ()) {
+        if (hev_app_filter_ctrl_init () < 0)
+            LOG_W ("[app-filter] control-socket init failed; continuing");
+    }
+
     signal (SIGPIPE, SIG_IGN);
 
     hev_task_mutex_init (&mutex);
@@ -654,6 +704,7 @@ hev_socks5_tunnel_fini (void)
 {
     LOG_D ("socks5 tunnel fini");
 
+    hev_app_filter_ctrl_fini ();
     mapped_dns_fini ();
     lwip_timer_task_fini ();
     lwip_io_task_fini ();

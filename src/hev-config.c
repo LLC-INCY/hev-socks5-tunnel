@@ -16,6 +16,7 @@
 #include "hev-logger.h"
 #include "hev-config.h"
 #include "hev-config-const.h"
+#include "hev-app-filter.h"
 
 static char tun_name[64];
 static unsigned int tun_mtu = 8500;
@@ -430,6 +431,8 @@ hev_config_parse_doc (yaml_document_t *doc)
             res = hev_config_parse_mapdns (doc, node);
         else if (0 == strcmp (key, "misc"))
             res = hev_config_parse_misc (doc, node);
+        else if (0 == strcmp (key, "app-filter"))
+            res = hev_app_filter_parse (doc, node);
 
         if (res < 0)
             return -1;

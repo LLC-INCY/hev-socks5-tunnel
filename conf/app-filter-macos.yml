@@ -1,0 +1,40 @@
+# macOS sample: per-app routing.
+#
+# Two stanzas below — one for "include" (only listed apps go through the
+# tunnel) and one for "exclude" (listed apps bypass it). Pick one when
+# generating tunnel.yml from your host app; never set both.
+
+tunnel:
+  name: utun
+  mtu: 8500
+  ipv4: 198.18.0.1
+socks5:
+  port: 10808
+  address: 127.0.0.1
+  udp: udp
+
+# --- Include mode ---
+# Only Firefox, Safari (by bundle id), and curl get tunnelled. Everything
+# else from the TUN is dropped (apps see "connection refused").
+app-filter:
+  mode: include
+  apps:
+    - "/Applications/Firefox.app/Contents/MacOS/firefox"
+    - "com.apple.Safari"
+    - "/usr/bin/curl"
+  unmatched: drop
+  control-socket: "/tmp/hev-incy.sock"
+
+# --- Exclude mode (alternative) ---
+# All traffic tunnelled except Spotify, which the host app will route
+# directly via a per-process exception. Requires a control socket so hev
+# can notify the host of bypass events.
+#
+# app-filter:
+#   mode: exclude
+#   apps:
+#     - "com.spotify.client"
+#   control-socket: "/tmp/hev-incy.sock"
+
+misc:
+  log-level: warn

@@ -1,0 +1,35 @@
+# Linux sample: per-app routing via cgroup-v2 + nftables.
+#
+# hev does NOT do in-process PID lookup on Linux. The host app:
+#   1. Creates a cgroup-v2 (e.g. /sys/fs/cgroup/incy-tunnelled).
+#   2. Migrates target PIDs into it (write to cgroup.procs).
+#   3. Installs nft rules so packets from that cgroup hit the TUN's
+#      routing table (include) or skip it (exclude).
+# See docs/INTEGRATION.md for the exact recipes.
+
+tunnel:
+  name: tun0
+  mtu: 8500
+  ipv4: 198.18.0.1
+socks5:
+  port: 10808
+  address: 127.0.0.1
+  udp: udp
+  mark: 1
+
+# --- Include mode ---
+# hev only logs/reports here; the actual enforcement is in nft.
+app-filter:
+  mode: include
+  cgroup-name: "incy-tunnelled"
+  control-socket: "/tmp/hev-incy.sock"
+  unmatched: drop      # informational on Linux; real drop is the nft rule
+
+# --- Exclude mode (alternative) ---
+# app-filter:
+#   mode: exclude
+#   cgroup-name: "incy-bypass"
+#   control-socket: "/tmp/hev-incy.sock"
+
+misc:
+  log-level: warn

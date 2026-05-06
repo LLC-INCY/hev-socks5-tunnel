@@ -1,0 +1,34 @@
+# Windows sample: per-app routing via in-process lookup.
+#
+# hev resolves the owning PID per flow via GetExtendedTcpTable /
+# GetExtendedUdpTable, then maps PID -> exe path. Match against `apps`
+# entries (case-insensitive). UWP / packaged apps are deferred in v1
+# and treated as unmatched.
+
+tunnel:
+  name: tunnel
+  mtu: 8500
+  ipv4: 198.18.0.1
+socks5:
+  port: 10808
+  address: 127.0.0.1
+  udp: udp
+
+# --- Include mode ---
+app-filter:
+  mode: include
+  apps:
+    - "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    - "C:\\Program Files\\Mozilla Firefox\\firefox.exe"
+  unmatched: drop
+  control-socket: "\\\\.\\pipe\\hev-incy"
+
+# --- Exclude mode (alternative) ---
+# app-filter:
+#   mode: exclude
+#   apps:
+#     - "C:\\Program Files\\Spotify\\Spotify.exe"
+#   control-socket: "\\\\.\\pipe\\hev-incy"
+
+misc:
+  log-level: warn

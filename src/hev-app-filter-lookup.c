@@ -697,7 +697,8 @@ build_uid_cache (int uid)
         while ((fde = readdir (fdd)) != NULL && b->n_entries < UID_CACHE_INODES) {
             if (fde->d_name[0] == '.')
                 continue;
-            char fdpath[128];
+            /* /proc/<pid>/fd/<name> — d_name is up to NAME_MAX (255). */
+            char fdpath[320];
             char target[64];
             snprintf (fdpath, sizeof (fdpath), "/proc/%ld/fd/%s", pid,
                       fde->d_name);
@@ -725,8 +726,7 @@ build_uid_cache (int uid)
 
             UidPathEntry *u = &b->entries[b->n_entries++];
             u->inode = ino;
-            strncpy (u->path, exe_path, sizeof (u->path) - 1);
-            u->path[sizeof (u->path) - 1] = '\0';
+            snprintf (u->path, sizeof (u->path), "%s", exe_path);
         }
         closedir (fdd);
     }

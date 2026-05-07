@@ -95,6 +95,12 @@ mono_now_sec (void)
     return (uint64_t) ts.tv_sec;
 }
 
+#endif /* HAVE_INPROC_LOOKUP */
+
+/* pid -> exe-path cache. Used by macOS / Windows resolvers; Linux uses
+ * its own uid-keyed cache so these are dead code there. */
+#if HAVE_MACOS_LOOKUP || defined(_WIN32) || defined(__MSYS__)
+
 static const char *
 cache_get (int pid)
 {
@@ -120,7 +126,7 @@ cache_put (int pid, const char *path)
     e->path[sizeof (e->path) - 1] = '\0';
 }
 
-#endif /* HAVE_INPROC_LOOKUP */
+#endif
 
 void
 hev_app_filter_lookup_cache_clear (void)

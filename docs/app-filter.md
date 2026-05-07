@@ -62,7 +62,30 @@ The filter decision happens once per *flow* at the lwIP boundary, not per packet
 
 The 5-tuple available at both points is sufficient for every per-OS lookup API below. The local app's source port (`pcb->remote_port` for TCP, `port` arg for UDP) is the primary key.
 
-### 3.1 Linux — cgroup-v2 (kernel-side, no in-process lookup)
+### 3.1 Linux — `SOCK_DIAG` netlink (in-process lookup)
+
+**Update (`2.14.4-incy.5`):** the cgroup-v2 design below is no longer
+required. Linux now resolves the owning process per flow via
+`NETLINK_INET_DIAG`, modeled on sing-box's
+`common/process/searcher_linux.go`:
+
+1. Lazily open one `AF_NETLINK/NETLINK_INET_DIAG` socket per (family,
+   proto). Reuse for the lifetime of hev.
+2. Send `inet_diag_req_v2` with the exact 5-tuple. The kernel returns
+   one `inet_diag_msg` carrying `idiag_uid` and `idiag_inode`.
+3. uid → `{inode → exe_path}` cache, 1s TTL, built by walking `/proc`
+   and filtering by `st_uid` per pid dir, then `readlink` on every
+   `/proc/<pid>/fd/*` to find `socket:[INODE]`.
+
+This works for the user running hev (typically root in our deployment)
+and needs no host-app cooperation. Cross-user PIDs return as
+`lookup-failed` and are treated as unmatched.
+
+The cgroup-v2/nft path documented below still works as a fallback /
+co-existence option (see `INTEGRATION.md`) but is no longer the
+default story.
+
+### 3.1.1 Linux — legacy: cgroup-v2 (no in-process lookup)
 
 hev does **not** look up PIDs on Linux. The host app:
 

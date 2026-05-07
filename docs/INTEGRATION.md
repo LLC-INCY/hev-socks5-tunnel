@@ -36,28 +36,42 @@ Asynchronous events from hev → host (only `bypass` in v1):
 Single-client policy: a second connection while one is open gets
 `{"ok":false,"error":"busy"}` and is closed immediately.
 
-## Linux: cgroup-v2 + nftables
+## Linux: in-process lookup (default)
 
-hev does no in-process lookup on Linux. The host app drives enforcement
-via the kernel.
+Since `2.14.4-incy.5`, hev does its own per-flow lookup on Linux via
+`SOCK_DIAG`/`NETLINK_INET_DIAG`. The host app does **nothing special**
+— same `tunnel.yml` schema as macOS/Windows:
 
-### One-time setup
-
-```sh
-# Create the cgroup. Name must match `app-filter.cgroup-name`.
-sudo mkdir -p /sys/fs/cgroup/incy-tunnelled
-
-# Make it writable by the user running the host (or run host as root).
-sudo chown -R "$USER" /sys/fs/cgroup/incy-tunnelled
+```yaml
+app-filter:
+  mode: include
+  apps:
+    - "/usr/bin/curl"
+    - "/usr/bin/firefox"
+  control-socket: "/tmp/hev-incy.sock"
 ```
 
-### nftables rule (include mode)
+No cgroup, no nftables, no host helper. hev opens a long-lived
+`AF_NETLINK` socket per (family, proto), sends an `inet_diag_req_v2`
+for each new flow's 5-tuple, and gets back the owning uid + socket
+inode. A 1s-TTL `/proc` scan filtered by uid maps inode → exe path.
 
-Mark packets from the cgroup, then policy-route them via the tunnel
-table. Combine with the existing `not fwmark 1 table <T>` rule that
-keeps hev's own SOCKS5 connect-back out of the loop.
+Permissions: works for the user running hev. Cross-user PIDs return
+unmatched (treated as lookup-failed). Since the helper that creates
+TUN typically runs as root, this isn't a problem in practice.
+
+## Linux (legacy): cgroup-v2 + nftables
+
+If you've already wired up the cgroup approach for an earlier
+hev-socks5-tunnel-incy, it still works — `app-filter.cgroup-name` is
+accepted for status reporting, and the in-process lookup happily
+co-exists with nft rules. New deployments should prefer the lookup
+path above.
 
 ```sh
+sudo mkdir -p /sys/fs/cgroup/incy-tunnelled
+sudo chown -R "$USER" /sys/fs/cgroup/incy-tunnelled
+
 sudo nft -f - <<'EOF'
 table inet incy {
     chain output {
@@ -66,24 +80,12 @@ table inet incy {
     }
 }
 EOF
-
-# Route mark 0x100 through table 100 (the tunnel).
 sudo ip rule add fwmark 0x100 table 100
 sudo ip route add default dev tun0 table 100
-```
 
-### Migrating PIDs
-
-```sh
-# Per app launch: write the PID into cgroup.procs.
+# Migrate target PIDs:
 echo $PID | sudo tee /sys/fs/cgroup/incy-tunnelled/cgroup.procs
 ```
-
-### Exclude mode
-
-Same recipe but invert the mark: mark traffic NOT in the cgroup, route
-that via the TUN; cgroup members fall through to default. Or use a
-second cgroup `incy-bypass` and skip it explicitly.
 
 ## macOS: in-process lookup
 

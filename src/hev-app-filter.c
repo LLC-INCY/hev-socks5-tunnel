@@ -45,7 +45,8 @@ static HevAppFilterStats g_stats;
 #include <TargetConditionals.h>
 #endif
 #if (defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX) || \
-    defined(_WIN32) || defined(__MSYS__)
+    defined(_WIN32) || defined(__MSYS__) ||                            \
+    (defined(__linux__) && !defined(__ANDROID__))
 #define HAVE_INPROC_LOOKUP 1
 #else
 #define HAVE_INPROC_LOOKUP 0
@@ -186,13 +187,6 @@ hev_app_filter_parse (yaml_document_t *doc, yaml_node_t *base)
            g_cgroup_name[0] ? g_cgroup_name : "(none)",
            g_control_socket[0] ? g_control_socket : "(none)");
 
-#if !defined(__APPLE__) && !defined(_WIN32) && !defined(__MSYS__)
-    if (g_apps_n > 0 && g_cgroup_name[0] == 0) {
-        LOG_W ("[app-filter] apps list set on Linux without cgroup-name; "
-               "host app must install nft cgroupv2 rules — hev does no "
-               "in-process lookup on Linux.");
-    }
-#endif
     return 0;
 }
 

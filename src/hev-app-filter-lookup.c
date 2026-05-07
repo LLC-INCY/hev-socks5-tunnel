@@ -44,10 +44,29 @@
 #define HAVE_MACOS_LOOKUP 0
 #endif
 
+/* Linux: SOCK_DIAG netlink + /proc fd scan. Skipped on Android — SELinux
+ * blocks reading other apps' /proc/<pid>/fd/, and uid->package mapping
+ * needs the host VPNService API which we don't have here. */
+#if defined(__linux__) && !defined(__ANDROID__)
+#define HAVE_LINUX_LOOKUP 1
+#include <dirent.h>
+#include <fcntl.h>
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/sock_diag.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#define HAVE_LINUX_LOOKUP 0
+#endif
+
 #define CACHE_SLOTS    64
 #define CACHE_TTL_SEC  60
 
-#if HAVE_MACOS_LOOKUP || defined(_WIN32) || defined(__MSYS__)
+#if HAVE_MACOS_LOOKUP || HAVE_LINUX_LOOKUP || \
+    defined(_WIN32) || defined(__MSYS__)
 #define HAVE_INPROC_LOOKUP 1
 #else
 #define HAVE_INPROC_LOOKUP 0
@@ -501,6 +520,250 @@ lookup_windows (const HevAppFilterFlow *flow, HevAppFilterLookupResult *out)
 
 #endif /* _WIN32 || __MSYS__ */
 
+#if HAVE_LINUX_LOOKUP
+
+/*
+ * Linux: SOCK_DIAG/NETLINK_INET_DIAG to map a 5-tuple to (uid, inode),
+ * then a uid-keyed /proc scan to map inode to exe path. Modeled on
+ * sing-box's common/process/searcher_linux.go but in C and without
+ * goroutines.
+ */
+
+/* Persistent netlink fds, one per (family, proto). Lazily created. */
+static int g_diag_fd[2][2] = { { -1, -1 }, { -1, -1 } };
+
+#define DIAG_FAMILY_IDX(fam) ((fam) == AF_INET6 ? 1 : 0)
+#define DIAG_PROTO_IDX(proto)                                                  \
+    ((proto) == HEV_APP_FILTER_PROTO_UDP ? 1 : 0)
+
+/* Per-uid inode->path cache with 1s TTL. */
+typedef struct
+{
+    unsigned long inode;
+    char          path[1024];
+} UidPathEntry;
+
+#define UID_CACHE_SLOTS  16
+#define UID_CACHE_INODES 64
+#define UID_CACHE_TTL_SEC 1
+
+typedef struct
+{
+    int          uid;
+    uint64_t     expires_mono;
+    int          n_entries;
+    UidPathEntry entries[UID_CACHE_INODES];
+} UidCacheBucket;
+
+static UidCacheBucket g_uid_cache[UID_CACHE_SLOTS];
+
+static int
+diag_fd_for (int family, int proto)
+{
+    int fi = DIAG_FAMILY_IDX (family);
+    int pi = DIAG_PROTO_IDX (proto);
+    if (g_diag_fd[fi][pi] >= 0)
+        return g_diag_fd[fi][pi];
+    int fd = socket (AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_INET_DIAG);
+    if (fd < 0)
+        return -1;
+    g_diag_fd[fi][pi] = fd;
+    return fd;
+}
+
+/* Send INET_DIAG_REQ_V2 for the exact 5-tuple, parse the (single)
+ * INET_DIAG_MSG reply for inode and uid. Returns 0 on success. */
+static int
+linux_diag_query (const HevAppFilterFlow *flow, int *out_uid,
+                  unsigned long *out_inode)
+{
+    int family = (flow->family == AF_INET6) ? AF_INET6 : AF_INET;
+    int fd = diag_fd_for (family,
+                          flow->proto == HEV_APP_FILTER_PROTO_UDP ? IPPROTO_UDP
+                                                                  : IPPROTO_TCP);
+    if (fd < 0)
+        return -1;
+
+    struct {
+        struct nlmsghdr nlh;
+        struct inet_diag_req_v2 req;
+    } msg;
+    memset (&msg, 0, sizeof (msg));
+    msg.nlh.nlmsg_len = sizeof (msg);
+    msg.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+    msg.nlh.nlmsg_flags = NLM_F_REQUEST;
+    msg.req.sdiag_family = (uint8_t) family;
+    msg.req.sdiag_protocol =
+        (flow->proto == HEV_APP_FILTER_PROTO_UDP) ? IPPROTO_UDP : IPPROTO_TCP;
+    /* For UDP we also accept LISTEN (=7) since unconnected sockets are
+     * common. For TCP, ESTABLISHED is the right state. */
+    if (flow->proto == HEV_APP_FILTER_PROTO_UDP)
+        msg.req.idiag_states = (1 << 7) | (1 << 1);
+    else
+        msg.req.idiag_states = 1 << 1; /* TCP_ESTABLISHED */
+
+    /* Convention: flow->local_* is the host-process side. */
+    msg.req.id.idiag_sport = htons (flow->local_port);
+    msg.req.id.idiag_dport = htons (flow->remote_port);
+    if (family == AF_INET) {
+        memcpy (msg.req.id.idiag_src, flow->local_addr, 4);
+        memcpy (msg.req.id.idiag_dst, flow->remote_addr, 4);
+    } else {
+        memcpy (msg.req.id.idiag_src, flow->local_addr, 16);
+        memcpy (msg.req.id.idiag_dst, flow->remote_addr, 16);
+    }
+
+    struct sockaddr_nl kern = { 0 };
+    kern.nl_family = AF_NETLINK;
+    ssize_t s = sendto (fd, &msg, sizeof (msg), 0,
+                        (struct sockaddr *) &kern, sizeof (kern));
+    if (s != (ssize_t) sizeof (msg))
+        return -1;
+
+    char buf[8192];
+    ssize_t got = recv (fd, buf, sizeof (buf), 0);
+    if (got <= 0)
+        return -1;
+
+    unsigned int len = (unsigned int) got;
+    struct nlmsghdr *nlh = (struct nlmsghdr *) buf;
+    for (; NLMSG_OK (nlh, len); nlh = NLMSG_NEXT (nlh, len)) {
+        if (nlh->nlmsg_type == NLMSG_DONE)
+            break;
+        if (nlh->nlmsg_type == NLMSG_ERROR)
+            return -1;
+        if (nlh->nlmsg_type != SOCK_DIAG_BY_FAMILY)
+            continue;
+        struct inet_diag_msg *r = NLMSG_DATA (nlh);
+        *out_uid = (int) r->idiag_uid;
+        *out_inode = (unsigned long) r->idiag_inode;
+        return 0;
+    }
+    return -1;
+}
+
+static uint64_t mono_now_sec (void); /* fwd-decl from cache section */
+
+static UidCacheBucket *
+uid_bucket (int uid)
+{
+    return &g_uid_cache[(unsigned) uid % UID_CACHE_SLOTS];
+}
+
+/* Rebuild the inode->path table for `uid` by walking /proc. Filters by
+ * st_uid on each pid dir to avoid touching processes we don't care
+ * about. Best-effort: missing entries (race with exit, EPERM on other
+ * users) are silently skipped. */
+static void
+build_uid_cache (int uid)
+{
+    UidCacheBucket *b = uid_bucket (uid);
+    b->uid = uid;
+    b->n_entries = 0;
+    b->expires_mono = mono_now_sec () + UID_CACHE_TTL_SEC;
+
+    DIR *proc = opendir ("/proc");
+    if (!proc)
+        return;
+    struct dirent *de;
+    while ((de = readdir (proc)) != NULL) {
+        char *end;
+        long pid = strtol (de->d_name, &end, 10);
+        if (*end != '\0' || pid <= 0)
+            continue;
+
+        char path[64];
+        snprintf (path, sizeof (path), "/proc/%ld", pid);
+        struct stat st;
+        if (stat (path, &st) < 0 || (int) st.st_uid != uid)
+            continue;
+
+        snprintf (path, sizeof (path), "/proc/%ld/fd", pid);
+        DIR *fdd = opendir (path);
+        if (!fdd)
+            continue;
+
+        char exe_path[1024];
+        exe_path[0] = '\0';
+
+        struct dirent *fde;
+        while ((fde = readdir (fdd)) != NULL && b->n_entries < UID_CACHE_INODES) {
+            if (fde->d_name[0] == '.')
+                continue;
+            char fdpath[128];
+            char target[64];
+            snprintf (fdpath, sizeof (fdpath), "/proc/%ld/fd/%s", pid,
+                      fde->d_name);
+            ssize_t n = readlink (fdpath, target, sizeof (target) - 1);
+            if (n <= 0)
+                continue;
+            target[n] = '\0';
+            if (strncmp (target, "socket:[", 8) != 0)
+                continue;
+            unsigned long ino = strtoul (target + 8, NULL, 10);
+            if (ino == 0)
+                continue;
+
+            if (exe_path[0] == '\0') {
+                char exelink[64];
+                snprintf (exelink, sizeof (exelink), "/proc/%ld/exe", pid);
+                ssize_t e = readlink (exelink, exe_path, sizeof (exe_path) - 1);
+                if (e > 0)
+                    exe_path[e] = '\0';
+                else
+                    exe_path[0] = '\0';
+            }
+            if (exe_path[0] == '\0')
+                continue;
+
+            UidPathEntry *u = &b->entries[b->n_entries++];
+            u->inode = ino;
+            strncpy (u->path, exe_path, sizeof (u->path) - 1);
+            u->path[sizeof (u->path) - 1] = '\0';
+        }
+        closedir (fdd);
+    }
+    closedir (proc);
+}
+
+static const char *
+uid_cache_lookup (int uid, unsigned long inode)
+{
+    UidCacheBucket *b = uid_bucket (uid);
+    if (b->uid != uid || b->expires_mono <= mono_now_sec ())
+        build_uid_cache (uid);
+    if (b->uid != uid)
+        return NULL;
+    for (int i = 0; i < b->n_entries; i++) {
+        if (b->entries[i].inode == inode)
+            return b->entries[i].path;
+    }
+    return NULL;
+}
+
+static int
+lookup_linux (const HevAppFilterFlow *flow, HevAppFilterLookupResult *out)
+{
+    int uid = -1;
+    unsigned long inode = 0;
+    if (linux_diag_query (flow, &uid, &inode) < 0)
+        return -1;
+
+    out->uid = uid;
+    /* We don't get a pid back from sock_diag — the kernel doesn't track
+     * it on the socket. PID lookup would need the /proc scan to remember
+     * which pid owned the inode, which is more state. For now, leave
+     * pid=-1; matching by `uids` and `apps` (path) still works. */
+    out->pid = -1;
+
+    const char *path = uid_cache_lookup (uid, inode);
+    if (path)
+        snprintf (out->path, sizeof (out->path), "%s", path);
+    return 0;
+}
+
+#endif /* HAVE_LINUX_LOOKUP */
+
 int
 hev_app_filter_lookup (const HevAppFilterFlow *flow,
                        HevAppFilterLookupResult *out)
@@ -519,12 +782,12 @@ hev_app_filter_lookup (const HevAppFilterFlow *flow,
     return lookup_macos (flow, out);
 #elif defined(_WIN32) || defined(__MSYS__)
     return lookup_windows (flow, out);
+#elif HAVE_LINUX_LOOKUP
+    return lookup_linux (flow, out);
 #else
-    /* Linux / iOS / Android: in-process lookup is intentionally
-     * unsupported. On Linux, cgroup-v2 + nft handles enforcement out of
-     * band; on mobile platforms, app-filter is configured no-op (the
-     * host VPN extension does the filtering). Returning -1 makes
-     * callers see lookup-failed and treat the flow as unmatched. */
+    /* iOS / Android: in-process lookup is intentionally unsupported;
+     * the host VPN extension does filtering. Returning -1 makes callers
+     * see lookup-failed and treat the flow as unmatched. */
     (void) flow;
     return -1;
 #endif
